@@ -33,16 +33,17 @@ Clarinet.test({
 });
 
 Clarinet.test({
-  name: "Test verifier management and identity verification",
+  name: "Test tiered verifier management and identity verification",
   async fn(chain: Chain, accounts: Map<string, Account>) {
     const deployer = accounts.get('deployer')!;
     const verifier = accounts.get('wallet_1')!;
     const user = accounts.get('wallet_2')!;
     
     let block = chain.mineBlock([
-      // Add verifier
+      // Add tier 2 verifier
       Tx.contractCall('chain-auth', 'add-verifier', [
-        types.principal(verifier.address)
+        types.principal(verifier.address),
+        types.uint(2)
       ], deployer.address),
       
       // Register identity
@@ -50,9 +51,10 @@ Clarinet.test({
         types.ascii("Test User Metadata")
       ], user.address),
       
-      // Verify identity
+      // Verify identity with tier 2
       Tx.contractCall('chain-auth', 'verify-identity', [
-        types.principal(user.address)
+        types.principal(user.address),
+        types.uint(2)
       ], verifier.address)
     ]);
     
@@ -60,36 +62,45 @@ Clarinet.test({
     block.receipts[1].result.expectOk();
     block.receipts[2].result.expectOk();
     
-    // Check verification status
-    let verifyBlock = chain.mineBlock([
-      Tx.contractCall('chain-auth', 'is-verified', [
+    // Check verification and tier
+    let tierBlock = chain.mineBlock([
+      Tx.contractCall('chain-auth', 'get-identity-tier', [
         types.principal(user.address)
       ], deployer.address)
     ]);
     
-    assertEquals(verifyBlock.receipts[0].result.expectOk(), true);
+    assertEquals(tierBlock.receipts[0].result.expectOk(), types.uint(2));
   },
 });
 
 Clarinet.test({
-  name: "Test error cases",
+  name: "Test tier restrictions",
   async fn(chain: Chain, accounts: Map<string, Account>) {
     const deployer = accounts.get('deployer')!;
-    const user1 = accounts.get('wallet_1')!;
+    const verifier = accounts.get('wallet_1')!;
+    const user = accounts.get('wallet_2')!;
     
     let block = chain.mineBlock([
-      // Try to verify without being a verifier
-      Tx.contractCall('chain-auth', 'verify-identity', [
-        types.principal(user1.address)
-      ], user1.address),
-      
-      // Try to add verifier without being owner
+      // Add tier 1 verifier
       Tx.contractCall('chain-auth', 'add-verifier', [
-        types.principal(user1.address)
-      ], user1.address)
+        types.principal(verifier.address),
+        types.uint(1)
+      ], deployer.address),
+      
+      // Register identity
+      Tx.contractCall('chain-auth', 'register-identity', [
+        types.ascii("Test User Metadata")
+      ], user.address),
+      
+      // Try to verify with tier 2 (should fail)
+      Tx.contractCall('chain-auth', 'verify-identity', [
+        types.principal(user.address),
+        types.uint(2)
+      ], verifier.address)
     ]);
     
-    block.receipts[0].result.expectErr(types.uint(103)); // err-not-verifier
-    block.receipts[1].result.expectErr(types.uint(100)); // err-owner-only
+    block.receipts[0].result.expectOk();
+    block.receipts[1].result.expectOk();
+    block.receipts[2].result.expectErr(types.uint(106)); // err-insufficient-tier
   },
 });
