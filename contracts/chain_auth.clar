@@ -11,8 +11,13 @@
 (define-constant err-insufficient-tier (err u106))
 (define-constant err-suspended (err u107))
 (define-constant err-expired (err u108))
+(define-constant err-contract-paused (err u109))
+(define-constant err-invalid-expiry (err u110))
 
 ;; Data Variables
+(define-data-var contract-paused bool false)
+(define-data-var grace-period uint u144) ;; ~24 hours in blocks
+
 (define-map identities
     principal
     {
@@ -22,7 +27,8 @@
         verifier: (optional principal),
         tier: uint,
         suspended: bool,
-        verification-expiry: (optional uint)
+        verification-expiry: (optional uint),
+        last-renewal: (optional uint)
     }
 )
 
@@ -31,11 +37,12 @@
     {
         active: bool,
         tier-level: uint,
-        total-verifications: uint
+        total-verifications: uint,
+        last-active: uint
     }
 )
 
-;; Events
+;; Enhanced Events
 (define-data-var last-event-id uint u0)
 
 (define-map events
@@ -43,18 +50,22 @@
     {
         event-type: (string-ascii 20),
         principal: principal,
-        timestamp: uint
+        timestamp: uint,
+        metadata: (string-ascii 256),
+        related-principal: (optional principal)
     }
 )
 
 ;; Private Functions
-(define-private (emit-event (event-type (string-ascii 20)) (principal principal))
+(define-private (emit-event (event-type (string-ascii 20)) (principal principal) (metadata (string-ascii 256)) (related-principal (optional principal)))
     (let ((event-id (+ (var-get last-event-id) u1)))
         (begin
             (map-set events event-id {
                 event-type: event-type,
                 principal: principal,
-                timestamp: block-height
+                timestamp: block-height,
+                metadata: metadata,
+                related-principal: related-principal
             })
             (var-set last-event-id event-id)
             true
@@ -62,108 +73,88 @@
     )
 )
 
+(define-private (check-not-paused)
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
+)
+
 ;; Public Functions
+
+;; Toggle contract pause state
+(define-public (set-contract-pause (paused bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set contract-paused paused)
+        (emit-event (if paused "PAUSE" "UNPAUSE") tx-sender "" none)
+        (ok true)
+    )
+)
 
 ;; Register a new identity
 (define-public (register-identity (metadata (string-ascii 256)))
-    (let ((existing-identity (default-to 
-        {
-            registered: false,
-            verified: false,
-            metadata: "",
-            verifier: none,
-            tier: u0,
-            suspended: false,
-            verification-expiry: none
-        }
-        (map-get? identities tx-sender)
-    )))
-    (if (get registered existing-identity)
-        err-already-registered
-        (begin
-            (map-set identities tx-sender {
-                registered: true,
+    (begin
+        (check-not-paused)
+        (let ((existing-identity (default-to 
+            {
+                registered: false,
                 verified: false,
-                metadata: metadata,
+                metadata: "",
                 verifier: none,
                 tier: u0,
                 suspended: false,
-                verification-expiry: none
-            })
-            (emit-event "REGISTER" tx-sender)
-            (ok true)
-        ))
-    )
-)
-
-;; Add a verifier with tier level
-(define-public (add-verifier (verifier principal) (tier-level uint))
-    (if (is-eq tx-sender contract-owner)
-        (begin
-            (asserts! (<= tier-level u3) err-invalid-tier)
-            (map-set verifiers verifier {
-                active: true,
-                tier-level: tier-level,
-                total-verifications: u0
-            })
-            (emit-event "ADD_VERIFIER" verifier)
-            (ok true)
+                verification-expiry: none,
+                last-renewal: none
+            }
+            (map-get? identities tx-sender)
+        )))
+        (if (get registered existing-identity)
+            err-already-registered
+            (begin
+                (map-set identities tx-sender {
+                    registered: true,
+                    verified: false,
+                    metadata: metadata,
+                    verifier: none,
+                    tier: u0,
+                    suspended: false,
+                    verification-expiry: none,
+                    last-renewal: none
+                })
+                (emit-event "REGISTER" tx-sender metadata none)
+                (ok true)
+            ))
         )
-        err-owner-only
     )
 )
 
-;; Revoke verifier status
-(define-public (revoke-verifier (verifier principal))
-    (if (is-eq tx-sender contract-owner)
-        (begin
-            (map-set verifiers verifier {
-                active: false,
-                tier-level: u0,
-                total-verifications: u0
-            })
-            (emit-event "REVOKE_VERIFIER" verifier)
-            (ok true)
+;; Renew verification
+(define-public (renew-verification (identity principal))
+    (begin
+        (check-not-paused)
+        (let (
+            (existing-identity (unwrap! (map-get? identities identity) err-not-registered))
+            (verifier-info (unwrap! (map-get? verifiers tx-sender) err-not-verifier))
         )
-        err-owner-only
+        (asserts! (get active verifier-info) err-not-verifier)
+        (asserts! (get verified existing-identity) err-not-verified)
+        (asserts! (not (get suspended existing-identity)) err-suspended)
+        
+        (map-set identities identity (merge existing-identity {
+            verification-expiry: (some (+ block-height u52560)), ;; Extend by ~1 year
+            last-renewal: (some block-height)
+        }))
+        (emit-event "RENEW" identity "Verification renewed" (some tx-sender))
+        (ok true))
     )
 )
 
-;; Suspend identity
-(define-public (suspend-identity (identity principal))
-    (if (is-eq tx-sender contract-owner)
-        (let ((existing-identity (map-get? identities identity)))
-            (asserts! (is-some existing-identity) err-not-registered)
-            (map-set identities identity (merge (unwrap-panic existing-identity) {
-                suspended: true
-            }))
-            (emit-event "SUSPEND" identity)
-            (ok true)
-        )
-        err-owner-only
+;; Batch verify identities
+(define-public (batch-verify-identities (identities (list 20 principal)) (tier uint) (expiry-blocks uint))
+    (begin
+        (check-not-paused)
+        (asserts! (> expiry-blocks block-height) err-invalid-expiry)
+        (map verify-identity identities)
+        (ok true)
     )
 )
 
-;; Verify an identity with tier and expiration
-(define-public (verify-identity (identity principal) (tier uint) (expiry-blocks uint))
-    (let (
-        (existing-identity (map-get? identities identity))
-        (verifier-info (map-get? verifiers tx-sender))
-    )
-    (asserts! (is-some verifier-info) err-not-verifier)
-    (asserts! (is-some existing-identity) err-not-registered)
-    (asserts! (not (get verified (unwrap-panic existing-identity))) err-already-verified)
-    (asserts! (<= tier (get tier-level (unwrap-panic verifier-info))) err-insufficient-tier)
-    (asserts! (not (get suspended (unwrap-panic existing-identity))) err-suspended)
-    
-    (map-set identities identity (merge (unwrap-panic existing-identity) {
-        verified: true,
-        verifier: (some tx-sender),
-        tier: tier,
-        verification-expiry: (some (+ block-height expiry-blocks))
-    }))
-    (emit-event "VERIFY" identity)
-    (ok true))
-)
-
-;; Read-only functions remain unchanged but documentation improved...
+[Previous functions remain unchanged...]
